@@ -19,7 +19,7 @@ namespace CardiacProject {
         // Impostazioni temporali iniziali della simulazione. 
         time = 0.0;
         time_step = 0.001; // ms 
-        final_time = 5.0; // ms
+        final_time = 40.0; // ms
     }
 
     template <int dim>
@@ -51,7 +51,7 @@ namespace CardiacProject {
             
             // Costruzione della mesh rettangolare che rappresenta il tessuto cardiaco.
             // h controlla la discretizzazione spaziale iniziale.
-            double h = 0.5; // Inizia grossolano (0.5mm), poi raffinabile
+            double h = 0.2; // Inizia grossolano (0.5mm), poi raffinabile
 
             std::vector<unsigned int> repetitions(dim);
             Point<dim> p1, p2;
@@ -143,20 +143,13 @@ namespace CardiacProject {
     {
         TimerOutput::Scope t(computing_timer, "Assembly");
 
-        // -------------------------------------------------------------
-        // Lucchetto statico per bloccare il ricalcolo.
-        // -------------------------------------------------------------
         static bool matrix_is_assembled = false;
 
-        // Azzeriamo la gigantesca matrice SOLO al primissimo giro.
         if (!matrix_is_assembled) {
             system_matrix = 0.0;
         }
         
-        // Il vettore va sempre azzerato perché la cronologia cambia.
         system_rhs = 0.0;
-        
-        // Conteggio locale delle celle effettivamente assemblate dal processo.
         unsigned int n_cells_assembled = 0;
 
         QGauss<dim> quadrature_formula(fe.degree + 1);
@@ -171,22 +164,19 @@ namespace CardiacProject {
         FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
         Vector<double> cell_rhs(dofs_per_cell);
         std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-        std::vector<double> current_solution_values(n_q_points);
+        
+        // CORREZIONE: Usare la classe Vector di deal.II, non std::vector!
+        Vector<double> local_solution_values(dofs_per_cell);
 
-        // Parametri fisici normalizzati del problema di diffusione.
-        // La diffusione è anisotropa: lungo fibra e trasversalmente la costante cambia.
         const double diff_l = 0.12; 
         const double diff_t = 0.013; 
-
-        // Termine di stimolo applicato nella zona iniziale e solo nei primi istanti.
-        const double Stim_val = 0.5; 
+        const double Stim_val = 0.5; // Valore corretto per il modello adimensionale
 
         Tensor<2, dim> diffusion;
         diffusion[0][0] = diff_l;
         diffusion[1][1] = diff_t;
         if (dim == 3) diffusion[2][2] = diff_t;
 
-        // Loop sulle celle locali: ogni cella contribuisce con il suo stencil FEM.
         for (const auto &cell : dof_handler.active_cell_iterators())
         {
             if (cell->is_locally_owned())
@@ -199,54 +189,51 @@ namespace CardiacProject {
                 }
                 
                 fe_values.reinit(cell);
-                fe_values.get_function_values(locally_relevant_solution, current_solution_values);
+                
+                // Estraiamo i valori nodali (ora local_solution_values ha il tipo corretto)
+                cell->get_dof_values(locally_relevant_solution, local_solution_values);
 
                 for (unsigned int q = 0; q < n_q_points; ++q)
                 {
                     const double JxW = fe_values.JxW(q);
+                    
+                    Point<dim> q_point = fe_values.quadrature_point(q);
+                    bool in_stim = true;
+                    for(unsigned int d=0; d<dim; ++d) 
+                        if(q_point[d] > 1.5) in_stim = false;
 
                     for (unsigned int i = 0; i < dofs_per_cell; ++i)
                     {
                         const auto phi_i = fe_values.shape_value(i, q);
                         
-                        // PARTE 1: LHS (Rigidezza e Massa)
-                        // Il lucchetto fa scartare questo pesantissimo calcolo per i restanti N-1 cicli.
                         if (!matrix_is_assembled) {
+                            // 1. MASS LUMPING SULLA MATRICE (LHS)
+                            double lumped_mass = (1.0 / time_step) * phi_i * JxW;
+                            cell_matrix(i, i) += lumped_mass; // Massa solo sulla diagonale
+
                             const auto grad_phi_i = fe_values.shape_grad(i, q);
                             for (unsigned int j = 0; j < dofs_per_cell; ++j)
                             {
-                                const auto phi_j = fe_values.shape_value(j, q);
                                 const auto grad_phi_j = fe_values.shape_grad(j, q);
-
-                                // MASSA: Ora è solo (1/dt) perché abbiamo diviso per Chi*Cm
-                                const double mass_term = (1.0 / time_step) * phi_i * phi_j;
-                                // STIFFNESS: Usa il tensore di diffusione D
                                 const double stiff_term = (grad_phi_i * (diffusion * grad_phi_j));
-
-                                cell_matrix(i, j) += (mass_term + stiff_term) * JxW;
+                                cell_matrix(i, j) += stiff_term * JxW; // Rigidezza inalterata
                             }
                         }
 
-                        // PARTE 2: RHS (Aggiornamento termico-cronologico sempre eseguito)
-                        // Termine esplicito che riporta la soluzione al passo precedente.
-                        double rhs_val = (1.0 / time_step) * current_solution_values[q] * phi_i;
+                        // 2. MASS LUMPING SUL VETTORE (RHS)
+                        double lumped_mass_q = (1.0 / time_step) * phi_i * JxW;
+                        
+                        // CORREZIONE: In deal.II si accede agli elementi con le parentesi tonde
+                        cell_rhs(i) += lumped_mass_q * local_solution_values(i);
 
-                        // Stimolo geometrico basato sulla posizione del punto di quadratura.
-                        Point<dim> q_point = fe_values.quadrature_point(q);
-                        bool in_stim = true;
-                        for(unsigned int d=0; d<dim; ++d) 
-                            if(q_point[d] > 1.5) in_stim = false;
-
+                        // 3. STIMOLO
                         if (in_stim && time <= 2.0) { 
-                            rhs_val += Stim_val * phi_i; 
+                            cell_rhs(i) += Stim_val * phi_i * JxW; 
                         }
-
-                        cell_rhs(i) += rhs_val * JxW;
                     }
                 }
                 cell->get_dof_indices(local_dof_indices);
                 
-                // Distribuzione MPI Dinamica: Invia la matrice solo se è la prima volta.
                 if (!matrix_is_assembled) {
                     constraints.distribute_local_to_global(cell_matrix, cell_rhs,
                                                           local_dof_indices,
@@ -257,25 +244,16 @@ namespace CardiacProject {
             }
         }
         
-        // Comprimiamo le somme parallele MPI globali
         if (!matrix_is_assembled) {
-            system_matrix.compress(VectorOperation::add); // Finalizzazione delle somme parziali parallele.
-            matrix_is_assembled = true; // Chiudiamo definitivamente il lucchetto!
+            system_matrix.compress(VectorOperation::add); 
+            matrix_is_assembled = true; 
             
             if (Utilities::MPI::this_mpi_process(mpi_communicator) == 0)
-                pcout << "=> Matrice di sistema assemblata (Il calcolo non verrà ripetuto)." << std::endl;
+                pcout << "=> Matrice assemblata. MASS LUMPING COMPLETO (LHS e RHS) attivato." << std::endl;
         }
-        system_rhs.compress(VectorOperation::add); // Finalizzazione delle somme parziali parallele.
-        
-        // Messaggio diagnostico emesso solo alla prima assemble.
-        static bool first_call = true;
-        if (first_call) {
-            pcout << "Process " << Utilities::MPI::this_mpi_process(mpi_communicator)
-                  << " assembled " << n_cells_assembled << " cells" << std::endl;
-            first_call = false;
-        }
+        system_rhs.compress(VectorOperation::add); 
     }
-
+    
     template <int dim>
     void CardiacProblem<dim>::solve_pde()
     {
@@ -341,7 +319,7 @@ namespace CardiacProject {
             // 2. Aggiornamento del potenziale transmembrana.
             state.u -= time_step * J_ion; 
             // Mantiene il potenziale in un intervallo fisicamente coerente.
-            state.u = std::max(0.0, std::min(1.0, state.u));
+            state.u = std::max(0.0, std::min(1.6, state.u));
 
             // 3. Evoluzione dei gate ionici.
             ionic_model.evolve_gates(state, time_step);
