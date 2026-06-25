@@ -1,35 +1,43 @@
 #include "../include/CardiacProblem.hpp"
-#include <memory> // Inserito per supportare std::shared_ptr
+#include <memory> // Inserito per supportare la gestione degli smart pointers (std::shared_ptr)
 
 namespace CardiacProject {
     using namespace dealii;
 
+    // =========================================================================
+    // COSTRUTTORE DELLA CLASSE
+    // Inizializza l'infrastruttura di calcolo distribuito MPI e i parametri temporali
+    // =========================================================================
     template <int dim>
     CardiacProblem<dim>::CardiacProblem(MeshMode mode, const std::string &mesh_filename)
         : current_mode(mode),                       
           external_mesh_filename(mesh_filename),    
-          mpi_communicator(MPI_COMM_WORLD),
-          triangulation(mpi_communicator),
-          fe(1), 
-          dof_handler(triangulation),
-          pcout(std::cout, (Utilities::MPI::this_mpi_process(mpi_communicator) == 0)),
+          mpi_communicator(MPI_COMM_WORLD), // Inizializzazione del contesto di comunicazione globale MPI
+          triangulation(mpi_communicator),  // La mesh parallela distribuita è legata al comunicatore
+          fe(1),                            // Elementi finiti lineari di Lagrange (Q1)
+          dof_handler(triangulation),       // Gestore dei Gradi di Libertà legato alla mesh parallela
+          pcout(std::cout, (Utilities::MPI::this_mpi_process(mpi_communicator) == 0)), // Stream di log attivo SOLO sul nodo Master (Processo 0)
           computing_timer(mpi_communicator, pcout, TimerOutput::summary,
-                          TimerOutput::wall_times) 
+                          TimerOutput::wall_times) // Profiler HPC per il tracciamento dei colli di bottiglia temporali
     {
-        // Impostazioni temporali iniziali della simulazione. 
+        // Parametri di integrazione temporale del problema accoppiato reazione-diffusione
         time = 0.0;
-        time_step = 0.001; // ms 
-        final_time = 40.0; // ms
+        time_step = 0.001; // ms - Passo temporale ridotto per garantire la stabilità numerica delle ODE rigide
+        final_time = 40.0; // ms - Orizzonte temporale sufficiente per osservare l'intero fronte di propagazione
     }
 
+    // =========================================================================
+    // SETUP DELLA GRIGLIA COMPUTAZIONALE
+    // Gestisce il binario di produzione (mesh esterna .msh) o il benchmark (mesh interna)
+    // =========================================================================
     template <int dim>
     void CardiacProblem<dim>::setup_grid() {
         TimerOutput::Scope t(computing_timer, "Setup Grid");
 
         if (current_mode == MeshMode::ExternalLoad) {
-            // ==========================================
-            // BINARIO 2: MODALITÀ PRODUZIONE (Mesh Esterna)
-            // ==========================================
+            // -----------------------------------------------------------------
+            // MODALITÀ PRODUZIONE: Caricamento mesh anatomica da file esterno
+            // -----------------------------------------------------------------
             pcout << "=> Modalità Produzione: Caricamento mesh ottimizzata dal file " 
                   << external_mesh_filename << " ..." << std::endl;
             
@@ -40,296 +48,319 @@ namespace CardiacProject {
             AssertThrow(input_file.is_open(), 
                         ExcMessage("Errore: impossibile aprire il file della mesh!"));
             
-            grid_in.read_msh(input_file);
+            grid_in.read_msh(input_file); // Lettura del formato Gmsh in modalità parallela distribuita
             pcout << "Mesh esterna caricata con successo!" << std::endl;
 
         } else {
-            // ==========================================
-            // BINARIO 1: MODALITÀ BENCHMARK (Mesh Interna)
-            // ==========================================
+            // -----------------------------------------------------------------
+            // MODALITÀ BENCHMARK: Generazione analitica del dominio rettangolare
+            // -----------------------------------------------------------------
             pcout << "=> Modalità Benchmark: Generazione interna della mesh in corso..." << std::endl;
             
-            // Costruzione della mesh rettangolare che rappresenta il tessuto cardiaco.
-            // h controlla la discretizzazione spaziale iniziale.
-            double h = 0.2; // Inizia grossolano (0.5mm), poi raffinabile
+            // h definisce il passo di discretizzazione spaziale iniziale (0.2 mm = risoluzione standard)
+            double h = 0.2; 
 
             std::vector<unsigned int> repetitions(dim);
             Point<dim> p1, p2;
 
-            // Dimensioni geometriche del dominio in mm.
+            // Definizione dei confini fisici del tessuto cardiaco in millimetri (20x7x3 mm)
             p1[0] = 0.0; p1[1] = 0.0; 
             p2[0] = 20.0; p2[1] = 7.0;
             if (dim == 3) {
                 p1[2] = 0.0; p2[2] = 3.0;
             }
 
+            // Calcolo automatico delle suddivisioni dei blocchi FEM in base ad h
             for(unsigned int d=0; d<dim; ++d)
                 repetitions[d] = static_cast<unsigned int>((p2[d]-p1[d])/h);
 
             GridGenerator::subdivided_hyper_rectangle(triangulation, repetitions, p1, p2);
 
-            // Tag del materiale: il box vicino all'origine rappresenta la zona di stimolo.
+            // Assegnazione dei tag del materiale per identificare geometricamente l'area dello stimolo elettrico
             for (const auto &cell : triangulation.active_cell_iterators()) {
                 if (cell->is_locally_owned()) {
                     Point<dim> center = cell->center();
                     bool in_stimulus_zone = true;
-                    // L'area di stimolo è definita come un cubo di lato 1.5 mm.
+                    // Lo stimolo iniziale viene applicato in un volume confinato nell'origine (cubo di lato 1.5 mm)
                     for(unsigned int d=0; d<dim; ++d)
                         if(center[d] > 1.5) in_stimulus_zone = false;
 
-                    if (in_stimulus_zone) cell->set_material_id(1); // ID 1 = Stimolo
-                    else cell->set_material_id(0); // ID 0 = Tessuto passivo
+                    if (in_stimulus_zone) cell->set_material_id(1); // ID 1: Tessuto stimolato/attivo
+                    else cell->set_material_id(0);                  // ID 0: Tessuto passivo a riposo
                 }
             }
         }
     }
 
+    // =========================================================================
+    // SETUP DELLE STRUTTURE ALGEBRICHE DISTRIBUITE (HPC CORE)
+    // Alloca lo spazio in memoria RAM per i vettori e le matrici MPI parallele
+    // =========================================================================
     template <int dim>
     void CardiacProblem<dim>::setup_system() {
         TimerOutput::Scope t(computing_timer, "Setup System");
             
-            // Distribuzione dei DoF sulla mesh parallela.
+            // Distribuzione globale dei gradi di libertà sui nodi della mesh parallela
             dof_handler.distribute_dofs(fe);
 
-            // DoF posseduti localmente e DoF necessari anche come ghost.
-            locally_owned_dofs = dof_handler.locally_owned_dofs();
-            locally_relevant_dofs = DoFTools::extract_locally_relevant_dofs(dof_handler);
+            // Estrazione degli insiemi di DoF per la segmentazione della memoria MPI
+            locally_owned_dofs = dof_handler.locally_owned_dofs(); // DoF fisicamente gestiti da questo core
+            locally_relevant_dofs = DoFTools::extract_locally_relevant_dofs(dof_handler); // DoF locali + Nodi Ghost di confine
             
-            // Informazioni diagnostiche sul partizionamento MPI.
+            // Log diagnostico sul partizionamento del bilanciamento del carico tra i processi MPI
             pcout << "Process " << Utilities::MPI::this_mpi_process(mpi_communicator) 
                   << ": owned=" << locally_owned_dofs.n_elements() 
                   << ", relevant=" << locally_relevant_dofs.n_elements()
                   << ", ghost=" << (locally_relevant_dofs.n_elements() - locally_owned_dofs.n_elements())
                   << std::endl;
 
-            // Conteggio globale utile per verificare la discretizzazione.
             pcout << "Number of active cells: " << triangulation.n_global_active_cells() << std::endl;
             pcout << "Number of degrees of freedom: " << dof_handler.n_dofs() << std::endl;
 
-            // Vincoli di continuità per i nodi hanging tra celle di dimensione diversa.
+            // Inizializzazione delle matrici di vincolo per garantire la continuità (es. nodi hanging)
             constraints.clear();
             constraints.reinit(locally_relevant_dofs);
             DoFTools::make_hanging_node_constraints(dof_handler, constraints);
             constraints.close();
 
-            // Costruzione della sparsity pattern per le matrici globali.
-            DynamicSparsityPattern dsp(locally_relevant_dofs);
-            DoFTools::make_sparsity_pattern(dof_handler, dsp, constraints, false);
-            SparsityPattern sparsity_pattern;
-            sparsity_pattern.copy_from(dsp);
+            // ==============================================================
+            // SOLUZIONE DEL BUG DI ISOLAMENTO PARALLELO: ALLOCAZIONE NATIVA TRILINOS
+            // Inizializziamo lo SparsityPattern legandolo direttamente ai DoF owned
+            // e al comunicatore MPI. Evitiamo classi seriali intermedie che 
+            // troncherebbero i canali di interscambio e accoppiamento inter-processore.
+            // ==============================================================
+            TrilinosWrappers::SparsityPattern sp(locally_owned_dofs, mpi_communicator);
+            DoFTools::make_sparsity_pattern(dof_handler, sp, constraints, false);
+            sp.compress(); // Sincronizzazione di rete per congelare i blocchi off-diagonal dei nodi ghost
 
-            // Allocazione delle strutture lineari distribuite.
-            system_matrix.reinit(locally_owned_dofs, locally_owned_dofs, sparsity_pattern, mpi_communicator);
-            mass_matrix.reinit(locally_owned_dofs, locally_owned_dofs, sparsity_pattern, mpi_communicator);
-            // solution contiene i DoF posseduti dal processo corrente.
+            // Allocazione delle matrici sparse parallele basate sulla topologia MPI validata
+            system_matrix.reinit(sp);
+            mass_matrix.reinit(sp);
+            
+            // Allocazione dei vettori distribuiti. solution e system_rhs allocano solo i DoF locali (owned)
             solution.reinit(locally_owned_dofs, mpi_communicator);
-            // locally_relevant_solution include anche i DoF ghost per letture in assembly.
-            locally_relevant_solution.reinit(locally_owned_dofs, locally_relevant_dofs, mpi_communicator);
             system_rhs.reinit(locally_owned_dofs, mpi_communicator);
+            
+            // locally_relevant_solution alloca anche i nodi ghost necessari per scambiare i dati di bordo
+            locally_relevant_solution.reinit(locally_owned_dofs, locally_relevant_dofs, mpi_communicator);
 
-            // Inizializzazione dei gate ionici locali, uno per ogni DoF owned.
+            // Allocazione delle strutture di memoria per le variabili ioniche contigue della ODE
             unsigned int n_local_dofs = locally_owned_dofs.n_elements();
-            gate_v.resize(n_local_dofs, 1.0); // v inizia a 1 (riposo)
-            gate_w.resize(n_local_dofs, 1.0); // w inizia a 1
-            gate_s.resize(n_local_dofs, 0.0); // s inizia a 0
+            gate_v.resize(n_local_dofs, 1.0); // v inizia a 1.0 (stato di riposo/pronto all'attivazione)
+            gate_w.resize(n_local_dofs, 1.0); // w inizia a 1.0
+            gate_s.resize(n_local_dofs, 0.0); // s inizia a 0.0 (canali del calcio chiusi)
 
-            // Tempo di attivazione per ogni DoF: -1 significa non ancora attivato.
+            // Vettore diagnostico di post-processing distribuito per mappare i tempi di attivazione
             activation_time.reinit(locally_owned_dofs, locally_relevant_dofs, mpi_communicator);
-            activation_time = -1.0; // Inizializza a -1 (non attivato)
+            activation_time = -1.0; // Inizializzazione a -1.0 (nodo non ancora attivato)
     }
 
+    // =========================================================================
+    // ASSEMBLAGGIO DEI SISTEMI LINEARI GLOBALO
+    // Sfrutta il Mass Lumping per ottimizzare l'algebra lineare parallela
+    // =========================================================================
     template <int dim>
     void CardiacProblem<dim>::assemble_system()
     {
         TimerOutput::Scope t(computing_timer, "Assembly");
 
-        static bool matrix_is_assembled = false;
+        // Lucchetti statici HPC per evitare di ricalcolare le matrici ad ogni istante temporale
+        static bool matrices_are_assembled = false;
+        static TrilinosWrappers::MPI::Vector stimulus_vector;
 
-        if (!matrix_is_assembled) {
+        // ---------------------------------------------------------------------
+        // FASE 1: SETUP UNA-TANTUM (Eseguito esclusivamente a t = 0)
+        // ---------------------------------------------------------------------
+        if (!matrices_are_assembled) {
             system_matrix = 0.0;
-        }
-        
-        system_rhs = 0.0;
-        unsigned int n_cells_assembled = 0;
+            mass_matrix = 0.0;
+            
+            stimulus_vector.reinit(locally_owned_dofs, mpi_communicator);
+            stimulus_vector = 0.0;
 
-        QGauss<dim> quadrature_formula(fe.degree + 1);
-        FEValues<dim> fe_values(fe,
-                                quadrature_formula,
-                                update_values | update_gradients |
-                                update_quadrature_points | update_JxW_values);
+            QGauss<dim> quadrature_formula(fe.degree + 1); // Punti di quadratura gaussiani
+            FEValues<dim> fe_values(fe, quadrature_formula,
+                                    update_values | update_gradients | update_quadrature_points | update_JxW_values);
 
-        const unsigned int dofs_per_cell = fe.dofs_per_cell;
-        const unsigned int n_q_points = quadrature_formula.size();
+            const unsigned int dofs_per_cell = fe.dofs_per_cell;
+            const unsigned int n_q_points = quadrature_formula.size();
 
-        FullMatrix<double> cell_matrix(dofs_per_cell, dofs_per_cell);
-        Vector<double> cell_rhs(dofs_per_cell);
-        std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
-        
-        // CORREZIONE: Usare la classe Vector di deal.II, non std::vector!
-        Vector<double> local_solution_values(dofs_per_cell);
+            FullMatrix<double> cell_system_matrix(dofs_per_cell, dofs_per_cell);
+            FullMatrix<double> cell_mass_matrix(dofs_per_cell, dofs_per_cell);
+            Vector<double> cell_stimulus(dofs_per_cell);
+            std::vector<types::global_dof_index> local_dof_indices(dofs_per_cell);
 
-        const double diff_l = 0.12; 
-        const double diff_t = 0.013; 
-        const double Stim_val = 0.5; // Valore corretto per il modello adimensionale
+            // Costanti fisiche conducibilità del tessuto anisotropo (mm^2/ms)
+            const double diff_l = 0.12;  // Conducibilità lungo la fibra cardidaca
+            const double diff_t = 0.013; // Conducibilità trasversale alla fibra
+            const double Stim_val = 0.5; // Intensità normalizzata della corrente di stimolo
 
-        Tensor<2, dim> diffusion;
-        diffusion[0][0] = diff_l;
-        diffusion[1][1] = diff_t;
-        if (dim == 3) diffusion[2][2] = diff_t;
+            Tensor<2, dim> diffusion;
+            diffusion[0][0] = diff_l;
+            diffusion[1][1] = diff_t;
+            if (dim == 3) diffusion[2][2] = diff_t;
 
-        for (const auto &cell : dof_handler.active_cell_iterators())
-        {
-            if (cell->is_locally_owned())
-            {
-                n_cells_assembled++;
-                cell_rhs = 0;
-                
-                if (!matrix_is_assembled) {
-                    cell_matrix = 0;
-                }
-                
-                fe_values.reinit(cell);
-                
-                // Estraiamo i valori nodali (ora local_solution_values ha il tipo corretto)
-                cell->get_dof_values(locally_relevant_solution, local_solution_values);
+            unsigned int n_cells_assembled = 0;
 
-                for (unsigned int q = 0; q < n_q_points; ++q)
-                {
-                    const double JxW = fe_values.JxW(q);
+            // Loop globale sugli elementi finiti locali assegnati al core corrente
+            for (const auto &cell : dof_handler.active_cell_iterators()) {
+                if (cell->is_locally_owned()) {
+                    n_cells_assembled++;
+                    cell_system_matrix = 0;
+                    cell_mass_matrix = 0;
+                    cell_stimulus = 0;
                     
-                    Point<dim> q_point = fe_values.quadrature_point(q);
-                    bool in_stim = true;
-                    for(unsigned int d=0; d<dim; ++d) 
-                        if(q_point[d] > 1.5) in_stim = false;
+                    fe_values.reinit(cell);
 
-                    for (unsigned int i = 0; i < dofs_per_cell; ++i)
-                    {
-                        const auto phi_i = fe_values.shape_value(i, q);
+                    for (unsigned int q = 0; q < n_q_points; ++q) {
+                        const double JxW = fe_values.JxW(q); // Determinante Jacobiano * Peso di quadratura
+                        Point<dim> q_point = fe_values.quadrature_point(q);
                         
-                        if (!matrix_is_assembled) {
-                            // 1. MASS LUMPING SULLA MATRICE (LHS)
-                            double lumped_mass = (1.0 / time_step) * phi_i * JxW;
-                            cell_matrix(i, i) += lumped_mass; // Massa solo sulla diagonale
+                        bool in_stim = true;
+                        for(unsigned int d=0; d<dim; ++d) 
+                            if(q_point[d] > 1.5) in_stim = false;
+
+                        for (unsigned int i = 0; i < dofs_per_cell; ++i) {
+                            const auto phi_i = fe_values.shape_value(i, q); // Funzione di forma i
+                            
+                            // -------------------------------------------------------------
+                            // IMPLEMENTAZIONE MASS LUMPING DIAGONALE
+                            // Ancoriamo la massa esclusivamente sull'indice principale (i, i)
+                            // Questo elimina numericamente gli undershoots e stabilizza l'onda
+                            // -------------------------------------------------------------
+                            double mass_lumped = (1.0 / time_step) * phi_i * JxW;
+                            cell_system_matrix(i, i) += mass_lumped;
+                            cell_mass_matrix(i, i) += mass_lumped;
 
                             const auto grad_phi_i = fe_values.shape_grad(i, q);
-                            for (unsigned int j = 0; j < dofs_per_cell; ++j)
-                            {
+                            for (unsigned int j = 0; j < dofs_per_cell; ++j) {
                                 const auto grad_phi_j = fe_values.shape_grad(j, q);
-                                const double stiff_term = (grad_phi_i * (diffusion * grad_phi_j));
-                                cell_matrix(i, j) += stiff_term * JxW; // Rigidezza inalterata
+                                double stiff_term = grad_phi_i * (diffusion * grad_phi_j);
+                                
+                                // La matrice di rigidezza spaziale (diffusione) rimane consistente
+                                cell_system_matrix(i, j) += stiff_term * JxW;
+                            }
+
+                            if (in_stim) {
+                                cell_stimulus(i) += Stim_val * phi_i * JxW;
                             }
                         }
-
-                        // 2. MASS LUMPING SUL VETTORE (RHS)
-                        double lumped_mass_q = (1.0 / time_step) * phi_i * JxW;
-                        
-                        // CORREZIONE: In deal.II si accede agli elementi con le parentesi tonde
-                        cell_rhs(i) += lumped_mass_q * local_solution_values(i);
-
-                        // 3. STIMOLO
-                        if (in_stim && time <= 2.0) { 
-                            cell_rhs(i) += Stim_val * phi_i * JxW; 
-                        }
                     }
-                }
-                cell->get_dof_indices(local_dof_indices);
-                
-                if (!matrix_is_assembled) {
-                    constraints.distribute_local_to_global(cell_matrix, cell_rhs,
-                                                          local_dof_indices,
-                                                          system_matrix, system_rhs);
-                } else {
-                    constraints.distribute_local_to_global(cell_rhs, local_dof_indices, system_rhs);
+                    cell->get_dof_indices(local_dof_indices);
+                    
+                    // Trasferimento dei contributi locali nei contenitori globali distribuiti MPI
+                    constraints.distribute_local_to_global(cell_system_matrix, local_dof_indices, system_matrix);
+                    constraints.distribute_local_to_global(cell_mass_matrix, local_dof_indices, mass_matrix);
+                    constraints.distribute_local_to_global(cell_stimulus, local_dof_indices, stimulus_vector);
                 }
             }
-        }
-        
-        if (!matrix_is_assembled) {
-            system_matrix.compress(VectorOperation::add); 
-            matrix_is_assembled = true; 
+            // Compressione algebrica finale e somme parziali inter-processore per le matrici statiche
+            system_matrix.compress(VectorOperation::add);
+            mass_matrix.compress(VectorOperation::add);
+            stimulus_vector.compress(VectorOperation::add);
             
-            if (Utilities::MPI::this_mpi_process(mpi_communicator) == 0)
-                pcout << "=> Matrice assemblata. MASS LUMPING COMPLETO (LHS e RHS) attivato." << std::endl;
+            matrices_are_assembled = true;
+            if (Utilities::MPI::this_mpi_process(mpi_communicator) == 0) {
+                pcout << "=> Matrici Pre-Assemblate. MASS LUMPING e MAGIA HPC ATTIVATI!" << std::endl;
+            }
         }
-        system_rhs.compress(VectorOperation::add); 
+
+        // ---------------------------------------------------------------------
+        // FASE 2: EFFETTIVA PRODUZIONE TEMPORALE (Eseguita 40.000 volte)
+        // Ottimizzazione HPC vettoriale: zero cicli interni e accessi RAM sequenziali
+        // ---------------------------------------------------------------------
+        system_rhs = 0.0;
+        
+        // Operazione parallela bloccante ottimizzata: system_rhs = mass_matrix * solution
+        // Essendo mass_matrix lumpata (diagonale pura), questa vmult è fulminea
+        mass_matrix.vmult(system_rhs, solution); 
+        
+        // Applicazione temporale del vettore di stimolo (durata transitoria = 2.0 ms)
+        if (time <= 2.0) {
+            system_rhs.add(1.0, stimulus_vector);
+        }
     }
     
+    // =========================================================================
+    // RISOLUTORE DELLA EQUAZIONE ALLE DERIVATE PARZIALI (PDE)
+    // =========================================================================
     template <int dim>
     void CardiacProblem<dim>::solve_pde()
     {
         TimerOutput::Scope t(computing_timer, "Solve PDE");
 
-        // Risolutore lineare CG con tolleranza relativa sul residuo.
+        // Solutore iterativo a Gradienti Coniugati (CG), ottimale per matrici simmetriche definite positive
         SolverControl solver_control(10000, 1e-6 * system_rhs.l2_norm());
         TrilinosWrappers::SolverCG solver(solver_control);
         
-        // -------------------------------------------------------------
-        // CORREZIONE HPC: Smart Pointer Statico per conservare l'AMG.
-        // -------------------------------------------------------------
-        // Precondizionatore AMG, adatto a problemi diffusive distribuiti in MPI.
-        // Usare un shared_ptr statico permette di inizializzare l'AMG solo al primo ciclo e riutilizzarlo per tutti i successivi, risparmiando tempo prezioso.
-        static std::shared_ptr<TrilinosWrappers::PreconditionAMG> preconditioner;
+        // ==============================================================
+        // SCELTA STRATEGICA PRECONDIZIONATORE: JACOBI DIAGONALE PURE
+        // Grazie al Mass Lumping e al dt ridotto, la matrice è fortemente
+        // a diagonale dominante. Jacobi non richiede alcuna comunicazione 
+        // di rete inter-processore, azzerando la latenza MPI latente dell'AMG.
+        // ==============================================================
+        static std::shared_ptr<TrilinosWrappers::PreconditionJacobi> preconditioner;
         
-        if (!amg_preconditioner) {
+        if (!preconditioner) {
             if (Utilities::MPI::this_mpi_process(mpi_communicator) == 0)
-                pcout << "=> Inizializzazione Precondizionatore AMG (Operazione una-tantum)..." << std::endl;
+                pcout << "=> Inizializzazione Precondizionatore Jacobi..." << std::endl;
 
-            amg_preconditioner = std::make_shared<TrilinosWrappers::PreconditionAMG>();
-            TrilinosWrappers::PreconditionAMG::AdditionalData amg_data;
-            amg_preconditioner->initialize(system_matrix, amg_data);
+            preconditioner = std::make_shared<TrilinosWrappers::PreconditionJacobi>();
+            preconditioner->initialize(system_matrix);
         }
-        // Il solver scrive solo nel vettore owned.
-        solver.solve(system_matrix, solution, system_rhs, *amg_preconditioner);
+        
+        // Risoluzione parallela distribuita del sistema lineare PDE
+        solver.solve(system_matrix, solution, system_rhs, *preconditioner);
 
-        // Applica i vincoli e sincronizza la soluzione tra i processi.
+        // Distribuzione e sincronizzazione dei vincoli tra le partizioni di memoria
         constraints.distribute(solution);
         solution.compress(VectorOperation::insert);
-        
-        // Copia verso il vettore ghosted usato nelle letture successive.
-        locally_relevant_solution = solution;
     }
 
+    // =========================================================================
+    // RISOLUTORE DELLE EQUAZIONI DIFFERENZIALI ORDINARIE (ODE - CANALI IONICI)
+    // Sfrutta il metodo di Forward Euler localizzato contiguo in cache
+    // =========================================================================
     template <int dim>
     void CardiacProblem<dim>::solve_ode()
     {
         TimerOutput::Scope t(computing_timer, "Solve ODE");
                 
-        // Evoluzione locale della reazione ionica su soli DoF posseduti.
         unsigned int local_idx = 0;
         IndexSet::ElementIterator idx = locally_owned_dofs.begin();
         IndexSet::ElementIterator endIdx = locally_owned_dofs.end();
 
+        // Loop contiguo sui soli DoF owned di proprietà locale per evitare collisioni di memoria
         for(; idx != endIdx; ++idx, ++local_idx) 
         {
             types::global_dof_index global_i = *idx;
             
-            // Copia lo stato corrente dal vettore globale ghosted ai gate locali.
+            // Estrazione dello stato locale (Voto potenziale u e variabili di gating v, w, s)
             IonicState state;
-            state.u = locally_relevant_solution(global_i);
+            state.u = solution(global_i); // Lettura diretta e locale senza chiamate ghost di rete
             state.v = gate_v[local_idx];
             state.w = gate_w[local_idx];
             state.s = gate_s[local_idx];
 
-            // 1. Calcolo della corrente ionica totale.
+            // 1. Calcolo della sommatoria delle correnti ioniche totali della cellula
             double J_ion = ionic_model.compute_total_current(state);
 
-            // Limite di sicurezza per evitare esplosioni numeriche.
+            // Salvavita numerico: clipping antiesplosione per gradienti transitori iper-ripidi
             if (std::abs(J_ion) > 100.0) J_ion = (J_ion > 0 ? 100.0 : -100.0);
 
-            // 2. Aggiornamento del potenziale transmembrana.
+            // 2. Aggiornamento esplicito (Forward Euler) del potenziale transmembrana
             state.u -= time_step * J_ion; 
-            // Mantiene il potenziale in un intervallo fisicamente coerente.
-            state.u = std::max(0.0, std::min(1.6, state.u));
+            state.u = std::max(0.0, std::min(1.6, state.u)); // Tetto a 1.6 per accogliere il picco reale di Bueno-Orovio (1.55)
 
-            // 3. Evoluzione dei gate ionici.
+            // 3. Evoluzione cinetica indipendente dei canali ionici di gating
             ionic_model.evolve_gates(state, time_step);
             
-            // Limita i gate nello stesso intervallo per robustezza numerica.
+            // Vincolo fisico per impedire alle frazioni di gate di uscire dal range probabilistico [0, 1]
             state.v = std::max(0.0, std::min(1.0, state.v));
             state.w = std::max(0.0, std::min(1.0, state.w));
             state.s = std::max(0.0, std::min(1.0, state.s));
 
-            // Scrive nel vettore owned, quindi senza conflitti MPI.
+            // Scrittura finale contigua nei registri di memoria locale
             solution(global_i) = state.u;
             gate_v[local_idx] = state.v;
             gate_w[local_idx] = state.w;
@@ -337,31 +368,28 @@ namespace CardiacProject {
         }
         
         solution.compress(VectorOperation::insert);
-        
-        // Aggiorna i ghost dopo la fase ODE.
-        locally_relevant_solution = solution;
     }
 
+    // =========================================================================
+    // CICLO DI EVOLUZIONE TEMPORALE (IL DRIVER PRINCIPALE)
+    // Coordinatore globale della pipeline numerica parallela
+    // =========================================================================
     template <int dim>
     void CardiacProblem<dim>::run()
     {
-        // Messaggio iniziale con il numero di processi MPI attivi.
         pcout << "Running Cardiac Problem on " 
             << Utilities::MPI::n_mpi_processes(mpi_communicator) 
             << " processes." << std::endl;
 
-         // Fase 1: costruzione del dominio e setup del sistema FEM.
         setup_grid();
         setup_system();
 
-        // Condizioni iniziali: potenziale nullo ovunque per partire da uno stato semplice.
+        // Condizioni iniziali a potenziale nullo ovunque (interpolazione analitica)
         VectorTools::interpolate(dof_handler, Functions::ZeroFunction<dim>(), solution);
-        locally_relevant_solution = solution;  // Sincronizza i ghost prima del primo output.
+        locally_relevant_solution = solution;  
 
-        // Scrive il primo snapshot al tempo t=0.
-        output_results(0); 
+        output_results(0); // Scrittura del frame di baseline a t=0
 
-        // Preparazione del ciclo temporale.
         unsigned int time_step_number = 0;
         const unsigned int total_steps = static_cast<unsigned int>(final_time / time_step);
         unsigned int last_progress = 0;
@@ -369,27 +397,28 @@ namespace CardiacProject {
         if (Utilities::MPI::this_mpi_process(mpi_communicator) == 0)
             std::cout << "Progress: 0%" << std::flush;
         
+        // ---------------------------------------------------------------------
+        // MAIN LOOPS DI SIMULAZIONE
+        // ---------------------------------------------------------------------
         while (time < final_time)
         {
             time_step_number++;
             time += time_step;
             
-            // 1. Fase diffusiva: costruzione e soluzione del sistema lineare.
+            // Catena dell'Operator Splitting spaziotemporale
             assemble_system();
-            solve_pde();
-
-            // 2. Fase reattiva: aggiornamento dei gate ionici.
-            solve_ode();
+            solve_pde(); // Fase diffusiva macroscopica
+            solve_ode(); // Fase reattiva microscopica cellulare
             
-            // Sincronizza i ghost prima delle letture successive.
-            locally_relevant_solution = solution;
+            // NOTA OPTIMIZATION: Sincronizzazione barriera locally_relevant_solution rimossa da qui 
+            // per evitare di intasare la rete 40.000 volte inutilmente.
             
-            // Log periodico del progresso solo dal processo master.
+            // Logging testuale periodico dello stato dell'upstroke
             if (time_step_number % 100 == 0 && Utilities::MPI::this_mpi_process(mpi_communicator) == 0) {
                 std::cout << "Step " << time_step_number << ", t=" << time << "ms" << std::endl;
             }
             
-            // Barra di progresso a intervalli di 5%.
+            // Aggiornamento asincrono della barra di progressione visiva su terminale master
             if (Utilities::MPI::this_mpi_process(mpi_communicator) == 0) {
                 unsigned int progress = (time_step_number * 100) / total_steps;
                 if (progress >= last_progress + 5) {
@@ -398,56 +427,52 @@ namespace CardiacProject {
                 }
             }
             
-            // Calcolo del tempo di attivazione sui soli DoF owned.
-            const double threshold = 0.5; // Soglia attivazione (modello adimensionale)
-            
-            for (const auto &cell : dof_handler.active_cell_iterators()) {
-                if (cell->is_locally_owned()) {
-                    std::vector<types::global_dof_index> local_dof_indices(fe.dofs_per_cell);
-                    cell->get_dof_indices(local_dof_indices);
-
-                    for (unsigned int i = 0; i < fe.dofs_per_cell; ++i) {
-                        auto idx = local_dof_indices[i];
-                        
-                        // Evita scritture duplicate tra processi MPI.
-                        if (locally_owned_dofs.is_element(idx)) {
-                            // Registra il primo istante in cui il nodo supera la soglia.
-                            if (activation_time(idx) == -1.0 && locally_relevant_solution(idx) > threshold) {
-                                activation_time(idx) = time;
-                            }
-                        }
-                    }
+            // -----------------------------------------------------------------
+            // HACK CACHE MEMORIA PER ACTIVATION TIME
+            // Scansione diretta basata sull'array continuo dei DoF di proprietà,
+            // evitando l'oneroso ciclo sugli iteratori attivi delle celle geometriche
+            // -----------------------------------------------------------------
+            const double threshold = 0.5; // Soglia convenzionale di superamento della depolarizzazione
+            for (IndexSet::ElementIterator it = locally_owned_dofs.begin(); it != locally_owned_dofs.end(); ++it) {
+                types::global_dof_index idx = *it;
+                if (activation_time(idx) == -1.0 && solution(idx) > threshold) {
+                    activation_time(idx) = time; // Registrazione cronometrica invariabile
                 }
             }
             activation_time.compress(VectorOperation::insert);
 
-            // Esporta un risultato ogni 100 passi per limitare il numero di file.
+            // -----------------------------------------------------------------
+            // EFFETTIVA ESPORTAZIONE DATI SU DISCO (GUEST SYNC ONLY FOR PARAVIEW)
+            // Limitiamo l'I/O ad intervalli di 100 passi per non strozzare la CPU
+            // -----------------------------------------------------------------
             if (time_step_number % 100 == 0) {
+                locally_relevant_solution = solution; // Unica sincronizzazione barriera ammessa
                 output_results(time_step_number);
             }
-        }
-        amg_preconditioner.reset(); // Libera la memoria dell'AMG alla fine della simulazione.
+        } // <-- Fine del ciclo temporale while
 
-        // Messaggio finale emesso solo dal processo master.
         if (Utilities::MPI::this_mpi_process(mpi_communicator) == 0)
             std::cout << "\rProgress: 100% - Simulation completed!" << std::endl;
     }
     
-    // Output parallelo compatibile con ParaView: produce .vtu per processo e .pvtu master.
+    // =========================================================================
+    // EXPORT RISULTATI PARALLELI IN FORMATO VTK/PARAVIEW (.vtu / .pvtu)
+    // =========================================================================
     template <int dim>
     void CardiacProblem<dim>::output_results(const unsigned int step) {
         DataOut<dim> data_out;
         data_out.attach_dof_handler(dof_handler);
 
-        // Vettori esportati: potenziale e tempo di attivazione.
+        // Vettori esportati completi di accoppiamento dei nodi ghost per prevenire artefatti grafici
         data_out.add_data_vector(locally_relevant_solution, "V");
         data_out.add_data_vector(activation_time, "ActivationTime");
         data_out.build_patches();
 
+        // Generazione del file record master .pvtu che cuce insieme i frammenti .vtu locali dei processi
         data_out.write_vtu_with_pvtu_record("./", "solution", step, mpi_communicator);
     }
 
-    // Istanziazioni esplicite per i casi 2D e 3D supportati dal progetto.
+    // Istanziazioni esplicite per le dimensioni geometriche supportate dal binario
     template class CardiacProblem<2>;
     template class CardiacProblem<3>;
 }
