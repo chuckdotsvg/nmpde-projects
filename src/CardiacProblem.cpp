@@ -23,7 +23,7 @@ namespace CardiacProject {
         // Parametri di integrazione temporale del problema accoppiato reazione-diffusione
         time = 0.0;
         time_step = 0.001; // ms - Passo temporale ridotto per garantire la stabilità numerica delle ODE rigide
-        final_time = 40.0; // ms - Orizzonte temporale sufficiente per osservare l'intero fronte di propagazione
+        final_time = 80.0; // ms - Orizzonte temporale sufficiente per osservare l'intero fronte di propagazione
     }
 
     // =========================================================================
@@ -58,7 +58,7 @@ namespace CardiacProject {
             pcout << "=> Modalità Benchmark: Generazione interna della mesh in corso..." << std::endl;
             
             // h definisce il passo di discretizzazione spaziale iniziale (0.2 mm = risoluzione standard)
-            double h = 0.2; 
+            double h = 0.2; // h=0.05 fa crashare il programma
 
             std::vector<unsigned int> repetitions(dim);
             Point<dim> p1, p2;
@@ -319,48 +319,91 @@ namespace CardiacProject {
 
     // =========================================================================
     // RISOLUTORE DELLE EQUAZIONI DIFFERENZIALI ORDINARIE (ODE - CANALI IONICI)
-    // Sfrutta il metodo di Forward Euler localizzato contiguo in cache
+    // Sfrutta il metodo di Forward Euler VETTORIALIZZATO (AVX2/SIMD)
     // =========================================================================
     template <int dim>
     void CardiacProblem<dim>::solve_ode()
     {
         TimerOutput::Scope t(computing_timer, "Solve ODE");
                 
+        // LARGHEZZA DEL REGISTRO SIMD (es. 4 per processori AVX2)
+        constexpr unsigned int vector_width = VectorizedArray<double>::size();
+        
         unsigned int local_idx = 0;
         IndexSet::ElementIterator idx = locally_owned_dofs.begin();
         IndexSet::ElementIterator endIdx = locally_owned_dofs.end();
+        unsigned int n_local = locally_owned_dofs.n_elements();
 
-        // Loop contiguo sui soli DoF owned di proprietà locale per evitare collisioni di memoria
-        for(; idx != endIdx; ++idx, ++local_idx) 
+        // ---------------------------------------------------------------------
+        // 1. CICLO VETTORIALE PRINCIPALE (Avanza a blocchi di 'vector_width')
+        // ---------------------------------------------------------------------
+        for(; local_idx + vector_width <= n_local; local_idx += vector_width) 
+        {
+            VectorizedArray<double> u_vec, v_vec, w_vec, s_vec;
+            std::vector<types::global_dof_index> global_indices(vector_width);
+
+            // FASE DI LOAD: Riempiamo i registri SIMD
+            for (unsigned int v = 0; v < vector_width; ++v) {
+                global_indices[v] = *idx;
+                u_vec[v] = solution(*idx);
+                v_vec[v] = gate_v[local_idx + v];
+                w_vec[v] = gate_w[local_idx + v];
+                s_vec[v] = gate_s[local_idx + v];
+                ++idx;
+            }
+
+            IonicState<VectorizedArray<double>> state = {u_vec, v_vec, w_vec, s_vec};
+
+            // FASE DI COMPUTE (Tutta la chimica di Bueno-Orovio per 4 nodi in un colpo solo)
+            VectorizedArray<double> J_ion = ionic_model.compute_total_current(state);
+
+            // Salvavita numerico SIMD (clipping tra -100 e 100 usando max/min vettoriali)
+            J_ion = std::max(VectorizedArray<double>(-100.0), std::min(VectorizedArray<double>(100.0), J_ion));
+
+            state.u -= VectorizedArray<double>(time_step) * J_ion; 
+            state.u = std::max(VectorizedArray<double>(0.0), std::min(VectorizedArray<double>(1.6), state.u)); 
+
+            ionic_model.evolve_gates(state, time_step);
+            
+            state.v = std::max(VectorizedArray<double>(0.0), std::min(VectorizedArray<double>(1.0), state.v));
+            state.w = std::max(VectorizedArray<double>(0.0), std::min(VectorizedArray<double>(1.0), state.w));
+            state.s = std::max(VectorizedArray<double>(0.0), std::min(VectorizedArray<double>(1.0), state.s));
+
+            // FASE DI STORE: Scarichiamo i risultati in RAM
+            for (unsigned int v = 0; v < vector_width; ++v) {
+                solution(global_indices[v]) = state.u[v];
+                gate_v[local_idx + v] = state.v[v];
+                gate_w[local_idx + v] = state.w[v];
+                gate_s[local_idx + v] = state.s[v];
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 2. TAIL-LOOP SEQUENZIALE
+        // Calcola in modo scalare gli ultimissimi nodi (resto della divisione intera)
+        // ---------------------------------------------------------------------
+        for(; local_idx < n_local; ++local_idx, ++idx) 
         {
             types::global_dof_index global_i = *idx;
             
-            // Estrazione dello stato locale (Voto potenziale u e variabili di gating v, w, s)
-            IonicState state;
-            state.u = solution(global_i); // Lettura diretta e locale senza chiamate ghost di rete
+            IonicState<double> state;
+            state.u = solution(global_i);
             state.v = gate_v[local_idx];
             state.w = gate_w[local_idx];
             state.s = gate_s[local_idx];
 
-            // 1. Calcolo della sommatoria delle correnti ioniche totali della cellula
             double J_ion = ionic_model.compute_total_current(state);
-
-            // Salvavita numerico: clipping antiesplosione per gradienti transitori iper-ripidi
             if (std::abs(J_ion) > 100.0) J_ion = (J_ion > 0 ? 100.0 : -100.0);
 
-            // 2. Aggiornamento esplicito (Forward Euler) del potenziale transmembrana
             state.u -= time_step * J_ion; 
-            state.u = std::max(0.0, std::min(1.6, state.u)); // Tetto a 1.6 per accogliere il picco reale di Bueno-Orovio (1.55)
+            state.u = std::max(0.0, std::min(1.6, state.u)); 
 
-            // 3. Evoluzione cinetica indipendente dei canali ionici di gating
             ionic_model.evolve_gates(state, time_step);
             
-            // Vincolo fisico per impedire alle frazioni di gate di uscire dal range probabilistico [0, 1]
             state.v = std::max(0.0, std::min(1.0, state.v));
             state.w = std::max(0.0, std::min(1.0, state.w));
             state.s = std::max(0.0, std::min(1.0, state.s));
 
-            // Scrittura finale contigua nei registri di memoria locale
             solution(global_i) = state.u;
             gate_v[local_idx] = state.v;
             gate_w[local_idx] = state.w;
