@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <deal.II/base/vectorization.h> // Indispensabile per le operazioni SIMD
 
 /**
  * @file IonicModel.hpp
@@ -15,13 +16,15 @@
  * governate dal potenziale u e da 3 variabili di gating (v, w, s).
  */
 
-// Stato locale della singola cellula (o nodo della mesh).
-// Nel modello di Bueno-Orovio il voltaggio 'u' è adimensionale (scala ~ 0.0 - 1.55).
+using namespace dealii; // Aggiunto per permettere l'uso diretto di SIMDComparison
+
+// Stato locale templatizzato per accettare sia 'double' singolo sia 'VectorizedArray<double>'
+template <typename Number>
 struct IonicState {
-    double u; // Potenziale transmembrana (adimensionale)
-    double v; // Gate v (governa la corrente rapida del sodio)
-    double w; // Gate w (governa le correnti lente, recupero)
-    double s; // Gate s (governa la corrente lenta entrante, plateau)
+    Number u; // Potenziale transmembrana (adimensionale)
+    Number v; // Gate v (governa la corrente rapida del sodio)
+    Number w; // Gate w (governa le correnti lente, recupero)
+    Number s; // Gate s (governa la corrente lenta entrante, plateau)
 };
 
 class IonicModel {
@@ -69,24 +72,25 @@ public:
 
     /**
      * @brief Calcola la somma delle correnti ioniche (RHS dell'equazione Monodominio).
+     * Funziona ora in modo agnostico per scalari e vettori SIMD.
      */
-    double compute_total_current(const IonicState &state) const {
-        double u = state.u;
-        double v = state.v;
-        double w = state.w;
-        double s = state.s;
+    template <typename Number>
+    Number compute_total_current(const IonicState<Number> &state) const {
+        Number u = state.u;
+        Number v = state.v;
+        Number w = state.w;
+        Number s = state.s;
 
-        // 1. J_fi: Corrente Rapida Entrante (Sodio). Responsabile dell'upstroke.
-        // Si accende SOLO se u supera la soglia theta_v (0.3).
-        double H_u_thv = (u > theta_v) ? 1.0 : 0.0;
-        double J_fi = -(v * H_u_thv * (u - theta_v) * (u_u - u)) / tau_fi;
+        // 1. J_fi: Maschera SIMD al posto del branching ternario '?'
+        Number H_u_thv = compare_and_apply_mask<SIMDComparison::greater_than>(u, Number(theta_v), Number(1.0), Number(0.0));
+        Number J_fi = -(v * H_u_thv * (u - Number(theta_v)) * (Number(u_u) - u)) / Number(tau_fi);
 
-        // 2. J_so: Corrente Lenta Uscente (Potassio). Responsabile della ripolarizzazione.
-        double H_u_thw = (u > theta_w) ? 1.0 : 0.0;
-        double J_so = ((u - u_o) * (1.0 - H_u_thw) / tau_o(u)) + (H_u_thw / tau_so(u));
+        // 2. J_so
+        Number H_u_thw = compare_and_apply_mask<SIMDComparison::greater_than>(u, Number(theta_w), Number(1.0), Number(0.0));
+        Number J_so = ((u - Number(u_o)) * (Number(1.0) - H_u_thw) / tau_o(u)) + (H_u_thw / tau_so(u));
 
-        // 3. J_si: Corrente Lenta Entrante (Calcio). Sostiene il plateau.
-        double J_si = - (H_u_thw * w * s) / tau_si;
+        // 3. J_si
+        Number J_si = - (H_u_thw * w * s) / Number(tau_si);
 
         return J_fi + J_so + J_si;
     }
@@ -94,35 +98,35 @@ public:
     /**
      * @brief Evolve le variabili di gating nel tempo usando Forward Euler esplicito.
      */
-    void evolve_gates(IonicState &state, double dt) const {
-        double u = state.u;
+    template <typename Number>
+    void evolve_gates(IonicState<Number> &state, double dt) const {
+        Number u = state.u;
+        Number time_step = Number(dt); // Promozione di dt a Number
         
         // --- Evoluzione GATE V (Sodio) ---
-        double H_u_thv_m = (u > theta_v_minus) ? 1.0 : 0.0;
-        double v_inf = (u < theta_v_minus) ? 1.0 : 0.0;
-        double tau_v_m = (1.0 - H_u_thv_m) * tau_v1_minus + H_u_thv_m * tau_v2_minus;
+        Number H_u_thv_m = compare_and_apply_mask<SIMDComparison::greater_than>(u, Number(theta_v_minus), Number(1.0), Number(0.0));
+        Number v_inf = compare_and_apply_mask<SIMDComparison::less_than>(u, Number(theta_v_minus), Number(1.0), Number(0.0));
+        Number tau_v_m = (Number(1.0) - H_u_thv_m) * Number(tau_v1_minus) + H_u_thv_m * Number(tau_v2_minus);
         
-        // L'integrazione di v dipende RIGOROSAMENTE dalla vera soglia di attivazione (theta_v = 0.3)
-        double H_u_thv = (u > theta_v) ? 1.0 : 0.0;
-        double dv = (1.0 - H_u_thv) * (v_inf - state.v) / tau_v_m - H_u_thv * state.v / tau_v_plus;
-        state.v += dt * dv;
+        Number H_u_thv = compare_and_apply_mask<SIMDComparison::greater_than>(u, Number(theta_v), Number(1.0), Number(0.0));
+        Number dv = (Number(1.0) - H_u_thv) * (v_inf - state.v) / tau_v_m - H_u_thv * state.v / Number(tau_v_plus);
+        state.v += time_step * dv;
 
         // --- Evoluzione GATE W (Potassio) ---
-        double H_u_tho = (u > theta_o) ? 1.0 : 0.0;
-        double w_inf = (1.0 - H_u_tho) * (1.0 - (u / tau_w_inf)) + H_u_tho * w_inf_star;
+        Number H_u_tho = compare_and_apply_mask<SIMDComparison::greater_than>(u, Number(theta_o), Number(1.0), Number(0.0));
+        Number w_inf = (Number(1.0) - H_u_tho) * (Number(1.0) - (u / Number(tau_w_inf))) + H_u_tho * Number(w_inf_star);
         
-        double tau_w_m = tau_w1_minus + (tau_w2_minus - tau_w1_minus) * (1.0 + std::tanh(k_w_minus * (u - u_w_minus))) / 2.0;
+        // Sostituzione di std::tanh con la nostra helper SIMD-compatibile
+        Number tau_w_m = Number(tau_w1_minus) + (Number(tau_w2_minus) - Number(tau_w1_minus)) * (Number(1.0) + custom_tanh(Number(k_w_minus) * (u - Number(u_w_minus)))) / Number(2.0);
         
-        // L'integrazione di w dipende RIGOROSAMENTE dalla soglia per correnti lente (theta_w = 0.13)
-        double H_u_thw = (u > theta_w) ? 1.0 : 0.0;
-        double dw = (1.0 - H_u_thw) * (w_inf - state.w) / tau_w_m - H_u_thw * state.w / tau_w_plus;
-        state.w += dt * dw;
+        Number H_u_thw = compare_and_apply_mask<SIMDComparison::greater_than>(u, Number(theta_w), Number(1.0), Number(0.0));
+        Number dw = (Number(1.0) - H_u_thw) * (w_inf - state.w) / tau_w_m - H_u_thw * state.w / Number(tau_w_plus);
+        state.w += time_step * dw;
 
         // --- Evoluzione GATE S (Calcio) ---
-        // Anche tau_s dipende dalla soglia theta_w (0.13)
-        double tau_s = (1.0 - H_u_thw) * tau_s1 + H_u_thw * tau_s2; 
-        double ds = (((1.0 + std::tanh(k_s * (u - u_s))) * 0.5) - state.s)/tau_s;
-        state.s += dt * ds;
+        Number tau_s = (Number(1.0) - H_u_thw) * Number(tau_s1) + H_u_thw * Number(tau_s2); 
+        Number ds = (((Number(1.0) + custom_tanh(Number(k_s) * (u - Number(u_s)))) * Number(0.5)) - state.s) / tau_s;
+        state.s += time_step * ds;
     }
 
 private:
@@ -134,13 +138,24 @@ private:
     double w_inf_star;
     double tau_w_inf; 
 
-    // Funzioni helper per costanti di tempo dipendenti dal voltaggio
-    double tau_o(double u) const {
-        return (1.0 - (u > theta_o ? 1.0:0.0))*tau_o1 + (u > theta_o ? 1.0:0.0)*tau_o2;
+    // Funzioni helper aggiornate con i template
+    template <typename Number>
+    Number tau_o(Number u) const {
+        Number H_u_tho = compare_and_apply_mask<SIMDComparison::greater_than>(u, Number(theta_o), Number(1.0), Number(0.0));
+        return (Number(1.0) - H_u_tho) * Number(tau_o1) + H_u_tho * Number(tau_o2);
     }
 
-    double tau_so(double u) const {
-        return tau_so1 + (tau_so2 - tau_so1)*(1.0 + std::tanh(k_so*(u - u_so)))*0.5;
+    template <typename Number>
+    Number tau_so(Number u) const {
+        return Number(tau_so1) + (Number(tau_so2) - Number(tau_so1)) * (Number(1.0) + custom_tanh(Number(k_so)*(u - Number(u_so)))) * Number(0.5);
+    }
+
+    // HELPER MATEMATICO PER IL SIMD (Sostituisce std::tanh)
+    template <typename Number>
+    Number custom_tanh(Number x) const {
+        Number exp_pos = std::exp(x);
+        Number exp_neg = std::exp(-x);
+        return (exp_pos - exp_neg) / (exp_pos + exp_neg);
     }
 };
 
