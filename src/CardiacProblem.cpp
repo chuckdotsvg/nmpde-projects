@@ -261,7 +261,7 @@ namespace CardiacProject {
             
             matrices_are_assembled = true;
             if (Utilities::MPI::this_mpi_process(mpi_communicator) == 0) {
-                pcout << "=> Matrici Pre-Assemblate. MASS LUMPING e MAGIA HPC ATTIVATI!" << std::endl;
+                pcout << "=> Matrici Pre-Assemblate. MASS LUMPING e HPC OPTIMIZATION!" << std::endl;
             }
         }
 
