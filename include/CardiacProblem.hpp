@@ -99,7 +99,7 @@ namespace CardiacProject {
 
         // Matrici sparse globali del problema lineare.
         TrilinosWrappers::SparseMatrix system_matrix;
-        TrilinosWrappers::SparseMatrix mass_matrix; // Utile per il termine dV/dt
+        TrilinosWrappers::SparseMatrix mass_matrix; 
         
         // Vettori MPI: solution contiene solo gli owned DoF, mentre
         // locally_relevant_solution include anche i ghost per la lettura.
