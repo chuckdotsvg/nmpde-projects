@@ -6,7 +6,7 @@ int main(int argc, char *argv[])
     try
     {
         using namespace dealii;
-        using namespace CardiacProject; // Assicurati di usare il namespace giusto!
+        using namespace CardiacProject; 
 
         Utilities::MPI::MPI_InitFinalize mpi_initialization(argc, argv, 1);
 
@@ -14,7 +14,7 @@ int main(int argc, char *argv[])
         MeshMode mode = MeshMode::InternalGeneration;
         std::string mesh_file = "";
 
-        // Se da terminale hai scritto qualcosa dopo il nome del programma...
+        // Se da terminale hai scritto qualcosa dopo il nome del programma
         if (argc > 1) {
             mode = MeshMode::ExternalLoad;
             mesh_file = argv[1]; // Prendi il nome del file dal terminale
