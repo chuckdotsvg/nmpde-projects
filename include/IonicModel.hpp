@@ -81,7 +81,7 @@ public:
         Number w = state.w;
         Number s = state.s;
 
-        // 1. J_fi: Maschera SIMD al posto del branching ternario '?'
+        // 1. J_fi: Maschera SIMD al posto del branching ternario 
         Number H_u_thv = compare_and_apply_mask<SIMDComparison::greater_than>(u, Number(theta_v), Number(1.0), Number(0.0));
         Number J_fi = -(v * H_u_thv * (u - Number(theta_v)) * (Number(u_u) - u)) / Number(tau_fi);
 
