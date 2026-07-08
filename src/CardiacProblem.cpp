@@ -93,7 +93,7 @@ namespace CardiacProject {
     }
 
     // =========================================================================
-    // SETUP DELLE STRUTTURE ALGEBRICHE DISTRIBUITE (HPC CORE)
+    // SETUP DELLE STRUTTURE ALGEBRICHE DISTRIBUITE
     // Alloca lo spazio in memoria RAM per i vettori e le matrici MPI parallele
     // =========================================================================
     template <int dim>
@@ -164,7 +164,7 @@ namespace CardiacProject {
     {
         TimerOutput::Scope t(computing_timer, "Assembly");
 
-        // Lucchetti statici HPC per evitare di ricalcolare le matrici ad ogni istante temporale
+        // Lucchetti statici per evitare di ricalcolare le matrici ad ogni istante temporale
         static bool matrices_are_assembled = false;
         static TrilinosWrappers::MPI::Vector stimulus_vector;
 
@@ -267,7 +267,7 @@ namespace CardiacProject {
 
         // ---------------------------------------------------------------------
         // FASE 2: EFFETTIVA PRODUZIONE TEMPORALE (Eseguita 40.000 volte)
-        // Ottimizzazione HPC vettoriale: zero cicli interni e accessi RAM sequenziali
+        // Ottimizzazione vettoriale: zero cicli interni e accessi RAM sequenziali
         // ---------------------------------------------------------------------
         system_rhs = 0.0;
         
